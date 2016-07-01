@@ -5,40 +5,26 @@
 // tree. An additional intellectual property rights grant can be found
 // in the file PATENTS.  All contributing project authors may
 // be found in the AUTHORS file in the root of the source tree.
-#include "mkvparser/mkvparser.h"
 
-#if defined(_MSC_VER) && _MSC_VER < 1800
-#include <float.h>  // _isnan() / _finite()
-#define MSC_COMPAT
-#endif
+#include "mkvparser.hpp"
 
 #include <cassert>
-#include <cfloat>
 #include <climits>
 #include <cmath>
 #include <cstring>
-#include <memory>
 #include <new>
 
-#include "common/webmids.h"
+#ifdef _MSC_VER
+// Disable MSVC warnings that suggest making code non-portable.
+#pragma warning(disable : 4996)
+#endif
 
 namespace mkvparser {
-const float MasteringMetadata::kValueNotPresent = FLT_MAX;
-const long long Colour::kValueNotPresent = LLONG_MAX;
-
-#ifdef MSC_COMPAT
-inline bool isnan(double val) { return !!_isnan(val); }
-inline bool isinf(double val) { return !_finite(val); }
-#else
-inline bool isnan(double val) { return std::isnan(val); }
-inline bool isinf(double val) { return std::isinf(val); }
-#endif  // MSC_COMPAT
 
 IMkvReader::~IMkvReader() {}
 
-template <typename Type>
-Type* SafeArrayAlloc(unsigned long long num_elements,
-                     unsigned long long element_size) {
+template<typename Type> Type* SafeArrayAlloc(unsigned long long num_elements,
+                                             unsigned long long element_size) {
   if (num_elements == 0 || element_size == 0)
     return NULL;
 
@@ -46,10 +32,8 @@ Type* SafeArrayAlloc(unsigned long long num_elements,
   const unsigned long long num_bytes = num_elements * element_size;
   if (element_size > (kMaxAllocSize / num_elements))
     return NULL;
-  if (num_bytes != static_cast<size_t>(num_bytes))
-    return NULL;
 
-  return new (std::nothrow) Type[static_cast<size_t>(num_bytes)];
+  return new (std::nothrow) Type[num_bytes];
 }
 
 void GetVersion(int& major, int& minor, int& build, int& revision) {
@@ -108,65 +92,14 @@ long long ReadUInt(IMkvReader* pReader, long long pos, long& len) {
   return result;
 }
 
-// Reads an EBML ID and returns it.
-// An ID must at least 1 byte long, cannot exceed 4, and its value must be
-// greater than 0.
-// See known EBML values and EBMLMaxIDLength:
-// http://www.matroska.org/technical/specs/index.html
-// Returns the ID, or a value less than 0 to report an error while reading the
-// ID.
 long long ReadID(IMkvReader* pReader, long long pos, long& len) {
-  if (pReader == NULL || pos < 0)
-    return E_FILE_FORMAT_INVALID;
-
-  // Read the first byte. The length in bytes of the ID is determined by
-  // finding the first set bit in the first byte of the ID.
-  unsigned char temp_byte = 0;
-  int read_status = pReader->Read(pos, 1, &temp_byte);
-
-  if (read_status < 0)
-    return E_FILE_FORMAT_INVALID;
-  else if (read_status > 0)  // No data to read.
-    return E_BUFFER_NOT_FULL;
-
-  if (temp_byte == 0)  // ID length > 8 bytes; invalid file.
-    return E_FILE_FORMAT_INVALID;
-
-  int bit_pos = 0;
-  const int kMaxIdLengthInBytes = 4;
-  const int kCheckByte = 0x80;
-
-  // Find the first bit that's set.
-  bool found_bit = false;
-  for (; bit_pos < kMaxIdLengthInBytes; ++bit_pos) {
-    if ((kCheckByte >> bit_pos) & temp_byte) {
-      found_bit = true;
-      break;
-    }
-  }
-
-  if (!found_bit) {
-    // The value is too large to be a valid ID.
+  const long long id = ReadUInt(pReader, pos, len);
+  if (id < 0 || len < 1 || len > 4) {
+    // An ID must be at least 1 byte long, and cannot exceed 4.
+    // See EBMLMaxIDLength: http://www.matroska.org/technical/specs/index.html
     return E_FILE_FORMAT_INVALID;
   }
-
-  // Read the remaining bytes of the ID (if any).
-  const int id_length = bit_pos + 1;
-  long long ebml_id = temp_byte;
-  for (int i = 1; i < id_length; ++i) {
-    ebml_id <<= 8;
-    read_status = pReader->Read(pos + i, 1, &temp_byte);
-
-    if (read_status < 0)
-      return E_FILE_FORMAT_INVALID;
-    else if (read_status > 0)
-      return E_BUFFER_NOT_FULL;
-
-    ebml_id |= temp_byte;
-  }
-
-  len = id_length;
-  return ebml_id;
+  return id;
 }
 
 long long GetUIntLength(IMkvReader* pReader, long long pos, long& len) {
@@ -281,7 +214,7 @@ long UnserializeFloat(IMkvReader* pReader, long long pos, long long size_,
     result = d;
   }
 
-  if (mkvparser::isinf(result) || mkvparser::isnan(result))
+  if (std::isinf(result) || std::isnan(result))
     return E_FILE_FORMAT_INVALID;
 
   return 0;
@@ -336,7 +269,7 @@ long UnserializeString(IMkvReader* pReader, long long pos, long long size,
 
   unsigned char* const buf = reinterpret_cast<unsigned char*>(str);
 
-  const long status = pReader->Read(pos, static_cast<long>(size), buf);
+  const long status = pReader->Read(pos, size, buf);
 
   if (status) {
     delete[] str;
@@ -349,8 +282,9 @@ long UnserializeString(IMkvReader* pReader, long long pos, long long size,
   return 0;
 }
 
-long ParseElementHeader(IMkvReader* pReader, long long& pos, long long stop,
-                        long long& id, long long& size) {
+long ParseElementHeader(IMkvReader* pReader, long long& pos,
+                        long long stop, long long& id,
+                        long long& size) {
   if (stop >= 0 && pos >= stop)
     return E_FILE_FORMAT_INVALID;
 
@@ -374,10 +308,10 @@ long ParseElementHeader(IMkvReader* pReader, long long& pos, long long stop,
     return E_FILE_FORMAT_INVALID;
   }
 
-  // Avoid rolling over pos when very close to LLONG_MAX.
+  // Avoid rolling over pos when very close to LONG_LONG_MAX.
   const unsigned long long rollover_check =
       static_cast<unsigned long long>(pos) + len;
-  if (rollover_check > LLONG_MAX)
+  if (rollover_check > LONG_LONG_MAX)
     return E_FILE_FORMAT_INVALID;
 
   pos += len;  // consume length of size
@@ -456,13 +390,13 @@ bool Match(IMkvReader* pReader, long long& pos, unsigned long expected_id,
 
   unsigned long long rollover_check =
       static_cast<unsigned long long>(pos) + len;
-  if (rollover_check > LLONG_MAX)
+  if (rollover_check > LONG_LONG_MAX)
     return false;
 
   pos += len;  // consume length of size of payload
 
   rollover_check = static_cast<unsigned long long>(pos) + size;
-  if (rollover_check > LLONG_MAX)
+  if (rollover_check > LONG_LONG_MAX)
     return false;
 
   if ((pos + size) > available)
@@ -518,45 +452,66 @@ long long EBMLHeader::Parse(IMkvReader* pReader, long long& pos) {
     return status;
 
   pos = 0;
+  long long end = (available >= 1024) ? 1024 : available;
 
-  // Scan until we find what looks like the first byte of the EBML header.
-  const long long kMaxScanBytes = (available >= 1024) ? 1024 : available;
-  const unsigned char kEbmlByte0 = 0x1A;
-  unsigned char scan_byte = 0;
+  for (;;) {
+    unsigned char b = 0;
 
-  while (pos < kMaxScanBytes) {
-    status = pReader->Read(pos, 1, &scan_byte);
+    while (pos < end) {
+      status = pReader->Read(pos, 1, &b);
 
-    if (status < 0)  // error
-      return status;
-    else if (status > 0)
-      return E_BUFFER_NOT_FULL;
+      if (status < 0)  // error
+        return status;
 
-    if (scan_byte == kEbmlByte0)
+      if (b == 0x1A)
+        break;
+
+      ++pos;
+    }
+
+    if (b != 0x1A) {
+      if (pos >= 1024)
+        return E_FILE_FORMAT_INVALID;  // don't bother looking anymore
+
+      if ((total >= 0) && ((total - available) < 5))
+        return E_FILE_FORMAT_INVALID;
+
+      return available + 5;  // 5 = 4-byte ID + 1st byte of size
+    }
+
+    if ((total >= 0) && ((total - pos) < 5))
+      return E_FILE_FORMAT_INVALID;
+
+    if ((available - pos) < 5)
+      return pos + 5;  // try again later
+
+    long len;
+
+    const long long result = ReadUInt(pReader, pos, len);
+
+    if (result < 0)  // error
+      return result;
+
+    if (result == 0x0A45DFA3) {  // EBML Header ID
+      pos += len;  // consume ID
       break;
+    }
 
-    ++pos;
+    ++pos;  // throw away just the 0x1A byte, and try again
   }
 
-  long len = 0;
-  const long long ebml_id = ReadID(pReader, pos, len);
+  // pos designates start of size field
 
-  if (ebml_id == E_BUFFER_NOT_FULL)
-    return E_BUFFER_NOT_FULL;
+  // get length of size field
 
-  if (len != 4 || ebml_id != libwebm::kMkvEBML)
-    return E_FILE_FORMAT_INVALID;
-
-  // Move read pos forward to the EBML header size field.
-  pos += 4;
-
-  // Read length of size field.
+  long len;
   long long result = GetUIntLength(pReader, pos, len);
 
   if (result < 0)  // error
-    return E_FILE_FORMAT_INVALID;
-  else if (result > 0)  // need more data
-    return E_BUFFER_NOT_FULL;
+    return result;
+
+  if (result > 0)  // need more data
+    return result;
 
   if (len < 1 || len > 8)
     return E_FILE_FORMAT_INVALID;
@@ -567,7 +522,8 @@ long long EBMLHeader::Parse(IMkvReader* pReader, long long& pos) {
   if ((available - pos) < len)
     return pos + len;  // try again later
 
-  // Read the EBML header size.
+  // get the EBML header size
+
   result = ReadUInt(pReader, pos, len);
 
   if (result < 0)  // error
@@ -583,7 +539,7 @@ long long EBMLHeader::Parse(IMkvReader* pReader, long long& pos) {
   if ((available - pos) < result)
     return pos + result;
 
-  const long long end = pos + result;
+  end = pos + result;
 
   Init();
 
@@ -595,30 +551,30 @@ long long EBMLHeader::Parse(IMkvReader* pReader, long long& pos) {
     if (status < 0)  // error
       return status;
 
-    if (size == 0)
+    if (size == 0)  // weird
       return E_FILE_FORMAT_INVALID;
 
-    if (id == libwebm::kMkvEBMLVersion) {
+    if (id == 0x0286) {  // version
       m_version = UnserializeUInt(pReader, pos, size);
 
       if (m_version <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvEBMLReadVersion) {
+    } else if (id == 0x02F7) {  // read version
       m_readVersion = UnserializeUInt(pReader, pos, size);
 
       if (m_readVersion <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvEBMLMaxIDLength) {
+    } else if (id == 0x02F2) {  // max id length
       m_maxIdLength = UnserializeUInt(pReader, pos, size);
 
       if (m_maxIdLength <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvEBMLMaxSizeLength) {
+    } else if (id == 0x02F3) {  // max size length
       m_maxSizeLength = UnserializeUInt(pReader, pos, size);
 
       if (m_maxSizeLength <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvDocType) {
+    } else if (id == 0x0282) {  // doctype
       if (m_docType)
         return E_FILE_FORMAT_INVALID;
 
@@ -626,12 +582,12 @@ long long EBMLHeader::Parse(IMkvReader* pReader, long long& pos) {
 
       if (status)  // error
         return status;
-    } else if (id == libwebm::kMkvDocTypeVersion) {
+    } else if (id == 0x0287) {  // doctype version
       m_docTypeVersion = UnserializeUInt(pReader, pos, size);
 
       if (m_docTypeVersion <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvDocTypeReadVersion) {
+    } else if (id == 0x0285) {  // doctype read version
       m_docTypeReadVersion = UnserializeUInt(pReader, pos, size);
 
       if (m_docTypeReadVersion <= 0)
@@ -642,15 +598,6 @@ long long EBMLHeader::Parse(IMkvReader* pReader, long long& pos) {
   }
 
   if (pos != end)
-    return E_FILE_FORMAT_INVALID;
-
-  // Make sure DocType, DocTypeReadVersion, and DocTypeVersion are valid.
-  if (m_docType == NULL || m_docTypeReadVersion <= 0 || m_docTypeVersion <= 0)
-    return E_FILE_FORMAT_INVALID;
-
-  // Make sure EBMLMaxIDLength and EBMLMaxSizeLength are valid.
-  if (m_maxIdLength <= 0 || m_maxIdLength > 4 || m_maxSizeLength <= 0 ||
-      m_maxSizeLength > 8)
     return E_FILE_FORMAT_INVALID;
 
   return 0;
@@ -785,7 +732,7 @@ long long Segment::CreateInstance(IMkvReader* pReader, long long pos,
     // Handle "unknown size" for live streaming of webm files.
     const long long unknown_size = (1LL << (7 * len)) - 1;
 
-    if (id == libwebm::kMkvSegment) {
+    if (id == 0x08538067) {  // Segment ID
       if (size == unknown_size)
         size = -1;
 
@@ -795,9 +742,12 @@ long long Segment::CreateInstance(IMkvReader* pReader, long long pos,
       else if ((pos + size) > total)
         size = -1;
 
-      pSegment = new (std::nothrow) Segment(pReader, idpos, pos, size);
-      if (pSegment == NULL)
-        return E_PARSE_FAILED;
+      pSegment = new (std::nothrow) Segment(pReader, idpos,
+                                            // elem_size
+                                            pos, size);
+
+      if (pSegment == 0)
+        return -1;  // generic error
 
       return 0;  // success
     }
@@ -846,9 +796,9 @@ long long Segment::ParseHeaders() {
     long long pos = m_pos;
     const long long element_start = pos;
 
-    // Avoid rolling over pos when very close to LLONG_MAX.
+    // Avoid rolling over pos when very close to LONG_LONG_MAX.
     unsigned long long rollover_check = pos + 1ULL;
-    if (rollover_check > LLONG_MAX)
+    if (rollover_check > LONG_LONG_MAX)
       return E_FILE_FORMAT_INVALID;
 
     if ((pos + 1) > available)
@@ -877,7 +827,7 @@ long long Segment::ParseHeaders() {
     if (id < 0)
       return E_FILE_FORMAT_INVALID;
 
-    if (id == libwebm::kMkvCluster)
+    if (id == 0x0F43B675)  // Cluster ID
       break;
 
     pos += len;  // consume ID
@@ -912,9 +862,9 @@ long long Segment::ParseHeaders() {
 
     pos += len;  // consume length of size of element
 
-    // Avoid rolling over pos when very close to LLONG_MAX.
+    // Avoid rolling over pos when very close to LONG_LONG_MAX.
     rollover_check = static_cast<unsigned long long>(pos) + size;
-    if (rollover_check > LLONG_MAX)
+    if (rollover_check > LONG_LONG_MAX)
       return E_FILE_FORMAT_INVALID;
 
     const long long element_size = size + pos - element_start;
@@ -929,7 +879,7 @@ long long Segment::ParseHeaders() {
     if ((pos + size) > available)
       return pos + size;
 
-    if (id == libwebm::kMkvInfo) {
+    if (id == 0x0549A966) {  // Segment Info ID
       if (m_pInfo)
         return E_FILE_FORMAT_INVALID;
 
@@ -943,7 +893,7 @@ long long Segment::ParseHeaders() {
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvTracks) {
+    } else if (id == 0x0654AE6B) {  // Tracks ID
       if (m_pTracks)
         return E_FILE_FORMAT_INVALID;
 
@@ -957,7 +907,7 @@ long long Segment::ParseHeaders() {
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvCues) {
+    } else if (id == 0x0C53BB6B) {  // Cues ID
       if (m_pCues == NULL) {
         m_pCues = new (std::nothrow)
             Cues(this, pos, size, element_start, element_size);
@@ -965,7 +915,7 @@ long long Segment::ParseHeaders() {
         if (m_pCues == NULL)
           return -1;
       }
-    } else if (id == libwebm::kMkvSeekHead) {
+    } else if (id == 0x014D9B74) {  // SeekHead ID
       if (m_pSeekHead == NULL) {
         m_pSeekHead = new (std::nothrow)
             SeekHead(this, pos, size, element_start, element_size);
@@ -978,7 +928,7 @@ long long Segment::ParseHeaders() {
         if (status)
           return status;
       }
-    } else if (id == libwebm::kMkvChapters) {
+    } else if (id == 0x0043A770) {  // Chapters ID
       if (m_pChapters == NULL) {
         m_pChapters = new (std::nothrow)
             Chapters(this, pos, size, element_start, element_size);
@@ -991,7 +941,7 @@ long long Segment::ParseHeaders() {
         if (status)
           return status;
       }
-    } else if (id == libwebm::kMkvTags) {
+    } else if (id == 0x0254C367) {  // Tags ID
       if (m_pTags == NULL) {
         m_pTags = new (std::nothrow)
             Tags(this, pos, size, element_start, element_size);
@@ -1070,7 +1020,7 @@ long Segment::DoLoadCluster(long long& pos, long& len) {
     if (result < 0)  // error
       return static_cast<long>(result);
 
-    if (result > 0)
+    if (result > 0)  // weird
       return E_BUFFER_NOT_FULL;
 
     if ((segment_stop >= 0) && ((pos + len) > segment_stop))
@@ -1099,7 +1049,7 @@ long Segment::DoLoadCluster(long long& pos, long& len) {
     if (result < 0)  // error
       return static_cast<long>(result);
 
-    if (result > 0)
+    if (result > 0)  // weird
       return E_BUFFER_NOT_FULL;
 
     if ((segment_stop >= 0) && ((pos + len) > segment_stop))
@@ -1117,8 +1067,7 @@ long Segment::DoLoadCluster(long long& pos, long& len) {
 
     // pos now points to start of payload
 
-    if (size == 0) {
-      // Missing element payload: move on.
+    if (size == 0) {  // weird
       m_pos = pos;
       continue;
     }
@@ -1130,11 +1079,9 @@ long Segment::DoLoadCluster(long long& pos, long& len) {
       return E_FILE_FORMAT_INVALID;
     }
 
-    if (id == libwebm::kMkvCues) {
-      if (size == unknown_size) {
-        // Cues element of unknown size: Not supported.
-        return E_FILE_FORMAT_INVALID;
-      }
+    if (id == 0x0C53BB6B) {  // Cues ID
+      if (size == unknown_size)
+        return E_FILE_FORMAT_INVALID;  // TODO: liberalize
 
       if (m_pCues == NULL) {
         const long long element_size = (pos - idpos) + size;
@@ -1148,12 +1095,9 @@ long Segment::DoLoadCluster(long long& pos, long& len) {
       continue;
     }
 
-    if (id != libwebm::kMkvCluster) {
-      // Besides the Segment, Libwebm allows only cluster elements of unknown
-      // size. Fail the parse upon encountering a non-cluster element reporting
-      // unknown size.
+    if (id != 0x0F43B675) {  // Cluster ID
       if (size == unknown_size)
-        return E_FILE_FORMAT_INVALID;
+        return E_FILE_FORMAT_INVALID;  // TODO: liberalize
 
       m_pos = pos + size;  // consume payload
       continue;
@@ -1392,14 +1336,14 @@ bool Segment::AppendCluster(Cluster* pCluster) {
 }
 
 bool Segment::PreloadCluster(Cluster* pCluster, ptrdiff_t idx) {
-  if (pCluster == NULL || pCluster->m_index >= 0 || idx < m_clusterCount)
-    return false;
+  assert(pCluster);
+  assert(pCluster->m_index < 0);
+  assert(idx >= m_clusterCount);
 
   const long count = m_clusterCount + m_clusterPreloadCount;
 
   long& size = m_clusterSize;
-  if (size < count)
-    return false;
+  assert(size >= count);
 
   if (count >= size) {
     const long n = (size <= 0) ? 2048 : 2 * size;
@@ -1421,20 +1365,17 @@ bool Segment::PreloadCluster(Cluster* pCluster, ptrdiff_t idx) {
     size = n;
   }
 
-  if (m_clusters == NULL)
-    return false;
+  assert(m_clusters);
 
   Cluster** const p = m_clusters + idx;
 
   Cluster** q = m_clusters + count;
-  if (q < p || q >= (m_clusters + size))
-    return false;
+  assert(q >= p);
+  assert(q < (m_clusters + size));
 
   while (q > p) {
     Cluster** const qq = q - 1;
-
-    if ((*qq)->m_index >= 0)
-      return false;
+    assert((*qq)->m_index < 0);
 
     *q = *qq;
     q = qq;
@@ -1446,8 +1387,10 @@ bool Segment::PreloadCluster(Cluster* pCluster, ptrdiff_t idx) {
 }
 
 long Segment::Load() {
-  if (m_clusters != NULL || m_clusterSize != 0 || m_clusterCount != 0)
-    return E_PARSE_FAILED;
+  assert(m_clusters == NULL);
+  assert(m_clusterSize == 0);
+  assert(m_clusterCount == 0);
+  // assert(m_size >= 0);
 
   // Outermost (level 0) segment object has been constructed,
   // and pos designates start of payload.  We need to find the
@@ -1511,9 +1454,9 @@ long SeekHead::Parse() {
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvSeek)
+    if (id == 0x0DBB)  // SeekEntry ID
       ++entry_count;
-    else if (id == libwebm::kMkvVoid)
+    else if (id == 0x6C)  // Void ID
       ++void_element_count;
 
     pos += size;  // consume payload
@@ -1552,14 +1495,14 @@ long SeekHead::Parse() {
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvSeek) {
+    if (id == 0x0DBB) {  // SeekEntry ID
       if (ParseEntry(pReader, pos, size, pEntry)) {
         Entry& e = *pEntry++;
 
         e.element_start = idpos;
         e.element_size = (pos + size) - idpos;
       }
-    } else if (id == libwebm::kMkvVoid) {
+    } else if (id == 0x6C) {  // Void ID
       VoidElement& e = *pVoidElement++;
 
       e.element_start = idpos;
@@ -1663,7 +1606,7 @@ long Segment::ParseCues(long long off, long long& pos, long& len) {
 
   const long long id = ReadID(m_pReader, idpos, len);
 
-  if (id != libwebm::kMkvCues)
+  if (id != 0x0C53BB6B)  // Cues ID
     return E_FILE_FORMAT_INVALID;
 
   pos += len;  // consume ID
@@ -1745,7 +1688,7 @@ bool SeekHead::ParseEntry(IMkvReader* pReader, long long start, long long size_,
   if (seekIdId < 0)
     return false;
 
-  if (seekIdId != libwebm::kMkvSeekID)
+  if (seekIdId != 0x13AB)  // SeekID ID
     return false;
 
   if ((pos + len) > stop)
@@ -1787,9 +1730,9 @@ bool SeekHead::ParseEntry(IMkvReader* pReader, long long start, long long size_,
 
   pos += seekIdSize;  // consume SeekID payload
 
-  const long long seekPosId = ReadID(pReader, pos, len);
+  const long long seekPosId = ReadUInt(pReader, pos, len);
 
-  if (seekPosId != libwebm::kMkvSeekPosition)
+  if (seekPosId != 0x13AC)  // SeekPos ID
     return false;
 
   if ((pos + len) > stop)
@@ -1899,7 +1842,7 @@ bool Cues::Init() const {
       return false;
     }
 
-    if (id == libwebm::kMkvCuePoint) {
+    if (id == 0x3B) {  // CuePoint ID
       if (!PreloadCuePoint(cue_points_size, idpos))
         return false;
     }
@@ -1974,7 +1917,7 @@ bool Cues::LoadCuePoint() const {
     if ((m_pos + size) > stop)
       return false;
 
-    if (id != libwebm::kMkvCuePoint) {
+    if (id != 0x3B) {  // CuePoint ID
       m_pos += size;  // consume payload
       if (m_pos > stop)
         return false;
@@ -2104,8 +2047,8 @@ const CuePoint* Cues::GetLast() const {
 }
 
 const CuePoint* Cues::GetNext(const CuePoint* pCurr) const {
-  if (pCurr == NULL || pCurr->GetTimeCode() < 0 || m_cue_points == NULL ||
-      m_count < 1) {
+  if (pCurr == NULL || pCurr->GetTimeCode() < 0 ||
+      m_cue_points == NULL || m_count < 1) {
     return NULL;
   }
 
@@ -2285,7 +2228,7 @@ bool CuePoint::Load(IMkvReader* pReader) {
     long len;
 
     const long long id = ReadID(pReader, pos_, len);
-    if (id != libwebm::kMkvCuePoint)
+    if (id != 0x3B)
       return false;
 
     pos_ += len;  // consume ID
@@ -2325,10 +2268,10 @@ bool CuePoint::Load(IMkvReader* pReader) {
       return false;
     }
 
-    if (id == libwebm::kMkvCueTime)
+    if (id == 0x33)  // CueTime ID
       m_timecode = UnserializeUInt(pReader, pos, size);
 
-    else if (id == libwebm::kMkvCueTrackPositions)
+    else if (id == 0x37)  // CueTrackPosition(s) ID
       ++m_track_positions_count;
 
     pos += size;  // consume payload
@@ -2367,7 +2310,7 @@ bool CuePoint::Load(IMkvReader* pReader) {
     pos += len;  // consume Size field
     assert((pos + size) <= stop);
 
-    if (id == libwebm::kMkvCueTrackPositions) {
+    if (id == 0x37) {  // CueTrackPosition(s) ID
       TrackPosition& tp = *p++;
       if (!tp.Parse(pReader, pos, size)) {
         return false;
@@ -2416,11 +2359,13 @@ bool CuePoint::TrackPosition::Parse(IMkvReader* pReader, long long start_,
       return false;
     }
 
-    if (id == libwebm::kMkvCueTrack)
+    if (id == 0x77)  // CueTrack ID
       m_track = UnserializeUInt(pReader, pos, size);
-    else if (id == libwebm::kMkvCueClusterPosition)
+
+    else if (id == 0x71)  // CueClusterPos ID
       m_pos = UnserializeUInt(pReader, pos, size);
-    else if (id == libwebm::kMkvCueBlockNumber)
+
+    else if (id == 0x1378)  // CueBlockNumber
       m_block = UnserializeUInt(pReader, pos, size);
 
     pos += size;  // consume payload
@@ -2554,7 +2499,7 @@ const Cluster* Segment::GetNext(const Cluster* pCurr) {
       return NULL;
 
     const long long id = ReadID(m_pReader, pos, len);
-    if (id != libwebm::kMkvCluster)
+    if (id != 0x0F43B675)  // Cluster ID
       return NULL;
 
     pos += len;  // consume ID
@@ -2611,7 +2556,7 @@ const Cluster* Segment::GetNext(const Cluster* pCurr) {
     if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvCluster) {
+    if (id == 0x0F43B675) {  // Cluster ID
       const long long off_next_ = idpos - m_start;
 
       long long pos_;
@@ -2761,7 +2706,7 @@ long Segment::ParseNext(const Cluster* pCurr, const Cluster*& pResult,
 
     const long long id = ReadUInt(m_pReader, pos, len);
 
-    if (id != libwebm::kMkvCluster)
+    if (id != 0x0F43B675)  // weird: not Cluster ID
       return -1;
 
     pos += len;  // consume ID
@@ -2876,7 +2821,7 @@ long Segment::DoParseNext(const Cluster*& pResult, long long& pos, long& len) {
     const long long idpos = pos;  // absolute
     const long long idoff = pos - m_start;  // relative
 
-    const long long id = ReadID(m_pReader, idpos, len);  // absolute
+    const long long id = ReadUInt(m_pReader, idpos, len);  // absolute
 
     if (id < 0)  // error
       return static_cast<long>(id);
@@ -2926,7 +2871,7 @@ long Segment::DoParseNext(const Cluster*& pResult, long long& pos, long& len) {
       return E_FILE_FORMAT_INVALID;
     }
 
-    if (id == libwebm::kMkvCues) {
+    if (id == 0x0C53BB6B) {  // Cues ID
       if (size == unknown_size)
         return E_FILE_FORMAT_INVALID;
 
@@ -2952,7 +2897,7 @@ long Segment::DoParseNext(const Cluster*& pResult, long long& pos, long& len) {
       continue;
     }
 
-    if (id != libwebm::kMkvCluster) {  // not a Cluster ID
+    if (id != 0x0F43B675) {  // not a Cluster ID
       if (size == unknown_size)
         return E_FILE_FORMAT_INVALID;
 
@@ -3081,7 +3026,7 @@ long Segment::DoParseNext(const Cluster*& pResult, long long& pos, long& len) {
         return E_BUFFER_NOT_FULL;
 
       const long long idpos = pos;
-      const long long id = ReadID(m_pReader, idpos, len);
+      const long long id = ReadUInt(m_pReader, idpos, len);
 
       if (id < 0)  // error (or underflow)
         return static_cast<long>(id);
@@ -3090,7 +3035,10 @@ long Segment::DoParseNext(const Cluster*& pResult, long long& pos, long& len) {
       // that we have exhausted the sub-element's inside the cluster
       // whose ID we parsed earlier.
 
-      if (id == libwebm::kMkvCluster || id == libwebm::kMkvCues)
+      if (id == 0x0F43B675)  // Cluster ID
+        break;
+
+      if (id == 0x0C53BB6B)  // Cues ID
         break;
 
       pos += len;  // consume ID (of sub-element)
@@ -3258,7 +3206,7 @@ long Chapters::Parse() {
     if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvEditionEntry) {
+    if (id == 0x05B9) {  // EditionEntry ID
       status = ParseEdition(pos, size);
 
       if (status < 0)  // error
@@ -3371,10 +3319,10 @@ long Chapters::Edition::Parse(IMkvReader* pReader, long long pos,
     if (status < 0)  // error
       return status;
 
-    if (size == 0)
+    if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvChapterAtom) {
+    if (id == 0x36) {  // Atom ID
       status = ParseAtom(pReader, pos, size);
 
       if (status < 0)  // error
@@ -3504,20 +3452,20 @@ long Chapters::Atom::Parse(IMkvReader* pReader, long long pos, long long size) {
     if (status < 0)  // error
       return status;
 
-    if (size == 0)  // 0 length payload, skip.
+    if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvChapterDisplay) {
+    if (id == 0x00) {  // Display ID
       status = ParseDisplay(pReader, pos, size);
 
       if (status < 0)  // error
         return status;
-    } else if (id == libwebm::kMkvChapterStringUID) {
+    } else if (id == 0x1654) {  // StringUID ID
       status = UnserializeString(pReader, pos, size, m_string_uid);
 
       if (status < 0)  // error
         return status;
-    } else if (id == libwebm::kMkvChapterUID) {
+    } else if (id == 0x33C4) {  // UID ID
       long long val;
       status = UnserializeInt(pReader, pos, size, val);
 
@@ -3525,14 +3473,14 @@ long Chapters::Atom::Parse(IMkvReader* pReader, long long pos, long long size) {
         return status;
 
       m_uid = static_cast<unsigned long long>(val);
-    } else if (id == libwebm::kMkvChapterTimeStart) {
+    } else if (id == 0x11) {  // TimeStart ID
       const long long val = UnserializeUInt(pReader, pos, size);
 
       if (val < 0)  // error
         return static_cast<long>(val);
 
       m_start_timecode = val;
-    } else if (id == libwebm::kMkvChapterTimeEnd) {
+    } else if (id == 0x12) {  // TimeEnd ID
       const long long val = UnserializeUInt(pReader, pos, size);
 
       if (val < 0)  // error
@@ -3657,20 +3605,20 @@ long Chapters::Display::Parse(IMkvReader* pReader, long long pos,
     if (status < 0)  // error
       return status;
 
-    if (size == 0)  // No payload.
+    if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvChapString) {
+    if (id == 0x05) {  // ChapterString ID
       status = UnserializeString(pReader, pos, size, m_string);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvChapLanguage) {
+    } else if (id == 0x037C) {  // ChapterLanguage ID
       status = UnserializeString(pReader, pos, size, m_language);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvChapCountry) {
+    } else if (id == 0x037E) {  // ChapterCountry ID
       status = UnserializeString(pReader, pos, size, m_country);
 
       if (status)
@@ -3723,7 +3671,7 @@ long Tags::Parse() {
     if (size == 0)  // 0 length tag, read another
       continue;
 
-    if (id == libwebm::kMkvTag) {
+    if (id == 0x3373) {  // Tag ID
       status = ParseTag(pos, size);
 
       if (status < 0)
@@ -3839,7 +3787,7 @@ long Tags::Tag::Parse(IMkvReader* pReader, long long pos, long long size) {
     if (size == 0)  // 0 length tag, read another
       continue;
 
-    if (id == libwebm::kMkvSimpleTag) {
+    if (id == 0x27C8) {  // SimpleTag ID
       status = ParseSimpleTag(pReader, pos, size);
 
       if (status < 0)
@@ -3930,12 +3878,12 @@ long Tags::SimpleTag::Parse(IMkvReader* pReader, long long pos,
     if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvTagName) {
+    if (id == 0x5A3) {  // TagName ID
       status = UnserializeString(pReader, pos, size, m_tag_name);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvTagString) {
+    } else if (id == 0x487) {  // TagString ID
       status = UnserializeString(pReader, pos, size, m_tag_string);
 
       if (status)
@@ -3995,12 +3943,12 @@ long SegmentInfo::Parse() {
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvTimecodeScale) {
+    if (id == 0x0AD7B1) {  // Timecode Scale
       m_timecodeScale = UnserializeUInt(pReader, pos, size);
 
       if (m_timecodeScale <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvDuration) {
+    } else if (id == 0x0489) {  // Segment duration
       const long status = UnserializeFloat(pReader, pos, size, m_duration);
 
       if (status < 0)
@@ -4008,19 +3956,19 @@ long SegmentInfo::Parse() {
 
       if (m_duration < 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvMuxingApp) {
+    } else if (id == 0x0D80) {  // MuxingApp
       const long status =
           UnserializeString(pReader, pos, size, m_pMuxingAppAsUTF8);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvWritingApp) {
+    } else if (id == 0x1741) {  // WritingApp
       const long status =
           UnserializeString(pReader, pos, size, m_pWritingAppAsUTF8);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvTitle) {
+    } else if (id == 0x3BA9) {  // Title
       const long status = UnserializeString(pReader, pos, size, m_pTitleAsUTF8);
 
       if (status)
@@ -4034,7 +3982,7 @@ long SegmentInfo::Parse() {
   }
 
   const double rollover_check = m_duration * m_timecodeScale;
-  if (rollover_check > LLONG_MAX)
+  if (rollover_check > LONG_LONG_MAX)
     return E_FILE_FORMAT_INVALID;
 
   if (pos != stop)
@@ -4175,7 +4123,8 @@ long ContentEncoding::ParseContentEncAESSettingsEntry(
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvAESSettingsCipherMode) {
+    if (id == 0x7E8) {
+      // AESSettingsCipherMode
       aes->cipher_mode = UnserializeUInt(pReader, pos, size);
       if (aes->cipher_mode != 1)
         return E_FILE_FORMAT_INVALID;
@@ -4206,10 +4155,10 @@ long ContentEncoding::ParseContentEncodingEntry(long long start, long long size,
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvContentCompression)
+    if (id == 0x1034)  // ContentCompression ID
       ++compression_count;
 
-    if (id == libwebm::kMkvContentEncryption)
+    if (id == 0x1035)  // ContentEncryption ID
       ++encryption_count;
 
     pos += size;  // consume payload
@@ -4245,15 +4194,19 @@ long ContentEncoding::ParseContentEncodingEntry(long long start, long long size,
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvContentEncodingOrder) {
+    if (id == 0x1031) {
+      // ContentEncodingOrder
       encoding_order_ = UnserializeUInt(pReader, pos, size);
-    } else if (id == libwebm::kMkvContentEncodingScope) {
+    } else if (id == 0x1032) {
+      // ContentEncodingScope
       encoding_scope_ = UnserializeUInt(pReader, pos, size);
       if (encoding_scope_ < 1)
         return -1;
-    } else if (id == libwebm::kMkvContentEncodingType) {
+    } else if (id == 0x1033) {
+      // ContentEncodingType
       encoding_type_ = UnserializeUInt(pReader, pos, size);
-    } else if (id == libwebm::kMkvContentCompression) {
+    } else if (id == 0x1034) {
+      // ContentCompression ID
       ContentCompression* const compression =
           new (std::nothrow) ContentCompression();
       if (!compression)
@@ -4265,7 +4218,8 @@ long ContentEncoding::ParseContentEncodingEntry(long long start, long long size,
         return status;
       }
       *compression_entries_end_++ = compression;
-    } else if (id == libwebm::kMkvContentEncryption) {
+    } else if (id == 0x1035) {
+      // ContentEncryption ID
       ContentEncryption* const encryption =
           new (std::nothrow) ContentEncryption();
       if (!encryption)
@@ -4306,13 +4260,15 @@ long ContentEncoding::ParseCompressionEntry(long long start, long long size,
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvContentCompAlgo) {
+    if (id == 0x254) {
+      // ContentCompAlgo
       long long algo = UnserializeUInt(pReader, pos, size);
       if (algo < 0)
         return E_FILE_FORMAT_INVALID;
       compression->algo = algo;
       valid = true;
-    } else if (id == libwebm::kMkvContentCompSettings) {
+    } else if (id == 0x255) {
+      // ContentCompSettings
       if (size <= 0)
         return E_FILE_FORMAT_INVALID;
 
@@ -4359,11 +4315,13 @@ long ContentEncoding::ParseEncryptionEntry(long long start, long long size,
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvContentEncAlgo) {
+    if (id == 0x7E1) {
+      // ContentEncAlgo
       encryption->algo = UnserializeUInt(pReader, pos, size);
       if (encryption->algo != 5)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvContentEncKeyID) {
+    } else if (id == 0x7E2) {
+      // ContentEncKeyID
       delete[] encryption->key_id;
       encryption->key_id = NULL;
       encryption->key_id_len = 0;
@@ -4385,7 +4343,8 @@ long ContentEncoding::ParseEncryptionEntry(long long start, long long size,
 
       encryption->key_id = buf;
       encryption->key_id_len = buflen;
-    } else if (id == libwebm::kMkvContentSignature) {
+    } else if (id == 0x7E3) {
+      // ContentSignature
       delete[] encryption->signature;
       encryption->signature = NULL;
       encryption->signature_len = 0;
@@ -4407,7 +4366,8 @@ long ContentEncoding::ParseEncryptionEntry(long long start, long long size,
 
       encryption->signature = buf;
       encryption->signature_len = buflen;
-    } else if (id == libwebm::kMkvContentSigKeyID) {
+    } else if (id == 0x7E4) {
+      // ContentSigKeyID
       delete[] encryption->sig_key_id;
       encryption->sig_key_id = NULL;
       encryption->sig_key_id_len = 0;
@@ -4429,11 +4389,14 @@ long ContentEncoding::ParseEncryptionEntry(long long start, long long size,
 
       encryption->sig_key_id = buf;
       encryption->sig_key_id_len = buflen;
-    } else if (id == libwebm::kMkvContentSigAlgo) {
+    } else if (id == 0x7E5) {
+      // ContentSigAlgo
       encryption->sig_algo = UnserializeUInt(pReader, pos, size);
-    } else if (id == libwebm::kMkvContentSigHashAlgo) {
+    } else if (id == 0x7E6) {
+      // ContentSigHashAlgo
       encryption->sig_hash_algo = UnserializeUInt(pReader, pos, size);
-    } else if (id == libwebm::kMkvContentEncAESSettings) {
+    } else if (id == 0x7E7) {
+      // ContentEncAESSettings
       const long status = ParseContentEncAESSettingsEntry(
           pos, size, pReader, &encryption->aes_settings);
       if (status)
@@ -4920,7 +4883,7 @@ long Track::ParseContentEncodingsEntry(long long start, long long size) {
       return status;
 
     // pos now designates start of element
-    if (id == libwebm::kMkvContentEncoding)
+    if (id == 0x2240)  // ContentEncoding ID
       ++count;
 
     pos += size;  // consume payload
@@ -4945,7 +4908,7 @@ long Track::ParseContentEncodingsEntry(long long start, long long size) {
       return status;
 
     // pos now designates start of element
-    if (id == libwebm::kMkvContentEncoding) {
+    if (id == 0x2240) {  // ContentEncoding ID
       ContentEncoding* const content_encoding =
           new (std::nothrow) ContentEncoding();
       if (!content_encoding)
@@ -4977,222 +4940,9 @@ BlockEntry::Kind Track::EOSBlock::GetKind() const { return kBlockEOS; }
 
 const Block* Track::EOSBlock::GetBlock() const { return NULL; }
 
-bool PrimaryChromaticity::Parse(IMkvReader* reader, long long read_pos,
-                                long long value_size, bool is_x,
-                                PrimaryChromaticity** chromaticity) {
-  if (!reader)
-    return false;
-
-  std::auto_ptr<PrimaryChromaticity> chromaticity_ptr;
-
-  if (!*chromaticity) {
-    chromaticity_ptr.reset(new PrimaryChromaticity());
-  } else {
-    chromaticity_ptr.reset(*chromaticity);
-  }
-
-  if (!chromaticity_ptr.get())
-    return false;
-
-  float* value = is_x ? &chromaticity_ptr->x : &chromaticity_ptr->y;
-
-  double parser_value = 0;
-  const long long value_parse_status =
-      UnserializeFloat(reader, read_pos, value_size, parser_value);
-
-  *value = static_cast<float>(parser_value);
-
-  if (value_parse_status < 0 || *value < 0.0 || *value > 1.0)
-    return false;
-
-  *chromaticity = chromaticity_ptr.release();
-  return true;
-}
-
-bool MasteringMetadata::Parse(IMkvReader* reader, long long mm_start,
-                              long long mm_size, MasteringMetadata** mm) {
-  if (!reader || *mm)
-    return false;
-
-  std::auto_ptr<MasteringMetadata> mm_ptr(new MasteringMetadata());
-  if (!mm_ptr.get())
-    return false;
-
-  const long long mm_end = mm_start + mm_size;
-  long long read_pos = mm_start;
-
-  while (read_pos < mm_end) {
-    long long child_id = 0;
-    long long child_size = 0;
-
-    const long long status =
-        ParseElementHeader(reader, read_pos, mm_end, child_id, child_size);
-    if (status < 0)
-      return false;
-
-    if (child_id == libwebm::kMkvLuminanceMax) {
-      double value = 0;
-      const long long value_parse_status =
-          UnserializeFloat(reader, read_pos, child_size, value);
-      mm_ptr->luminance_max = static_cast<float>(value);
-      if (value_parse_status < 0 || mm_ptr->luminance_max < 0.0 ||
-          mm_ptr->luminance_max > 9999.99) {
-        return false;
-      }
-    } else if (child_id == libwebm::kMkvLuminanceMin) {
-      double value = 0;
-      const long long value_parse_status =
-          UnserializeFloat(reader, read_pos, child_size, value);
-      mm_ptr->luminance_min = static_cast<float>(value);
-      if (value_parse_status < 0 || mm_ptr->luminance_min < 0.0 ||
-          mm_ptr->luminance_min > 999.9999) {
-        return false;
-      }
-    } else {
-      bool is_x = false;
-      PrimaryChromaticity** chromaticity;
-      switch (child_id) {
-        case libwebm::kMkvPrimaryRChromaticityX:
-        case libwebm::kMkvPrimaryRChromaticityY:
-          is_x = child_id == libwebm::kMkvPrimaryRChromaticityX;
-          chromaticity = &mm_ptr->r;
-          break;
-        case libwebm::kMkvPrimaryGChromaticityX:
-        case libwebm::kMkvPrimaryGChromaticityY:
-          is_x = child_id == libwebm::kMkvPrimaryGChromaticityX;
-          chromaticity = &mm_ptr->g;
-          break;
-        case libwebm::kMkvPrimaryBChromaticityX:
-        case libwebm::kMkvPrimaryBChromaticityY:
-          is_x = child_id == libwebm::kMkvPrimaryBChromaticityX;
-          chromaticity = &mm_ptr->b;
-          break;
-        case libwebm::kMkvWhitePointChromaticityX:
-        case libwebm::kMkvWhitePointChromaticityY:
-          is_x = child_id == libwebm::kMkvWhitePointChromaticityX;
-          chromaticity = &mm_ptr->white_point;
-          break;
-        default:
-          return false;
-      }
-      const bool value_parse_status = PrimaryChromaticity::Parse(
-          reader, read_pos, child_size, is_x, chromaticity);
-      if (!value_parse_status)
-        return false;
-    }
-
-    read_pos += child_size;
-    if (read_pos > mm_end)
-      return false;
-  }
-
-  *mm = mm_ptr.release();
-  return true;
-}
-
-bool Colour::Parse(IMkvReader* reader, long long colour_start,
-                   long long colour_size, Colour** colour) {
-  if (!reader || *colour)
-    return false;
-
-  std::auto_ptr<Colour> colour_ptr(new Colour());
-  if (!colour_ptr.get())
-    return false;
-
-  const long long colour_end = colour_start + colour_size;
-  long long read_pos = colour_start;
-
-  while (read_pos < colour_end) {
-    long long child_id = 0;
-    long long child_size = 0;
-
-    const long status =
-        ParseElementHeader(reader, read_pos, colour_end, child_id, child_size);
-    if (status < 0)
-      return false;
-
-    if (child_id == libwebm::kMkvMatrixCoefficients) {
-      colour_ptr->matrix_coefficients =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->matrix_coefficients < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvBitsPerChannel) {
-      colour_ptr->bits_per_channel =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->bits_per_channel < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvChromaSubsamplingHorz) {
-      colour_ptr->chroma_subsampling_horz =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->chroma_subsampling_horz < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvChromaSubsamplingVert) {
-      colour_ptr->chroma_subsampling_vert =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->chroma_subsampling_vert < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvCbSubsamplingHorz) {
-      colour_ptr->cb_subsampling_horz =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->cb_subsampling_horz < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvCbSubsamplingVert) {
-      colour_ptr->cb_subsampling_vert =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->cb_subsampling_vert < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvChromaSitingHorz) {
-      colour_ptr->chroma_siting_horz =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->chroma_siting_horz < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvChromaSitingVert) {
-      colour_ptr->chroma_siting_vert =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->chroma_siting_vert < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvRange) {
-      colour_ptr->range = UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->range < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvTransferCharacteristics) {
-      colour_ptr->transfer_characteristics =
-          UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->transfer_characteristics < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvPrimaries) {
-      colour_ptr->primaries = UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->primaries < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvMaxCLL) {
-      colour_ptr->max_cll = UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->max_cll < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvMaxFALL) {
-      colour_ptr->max_fall = UnserializeUInt(reader, read_pos, child_size);
-      if (colour_ptr->max_fall < 0)
-        return false;
-    } else if (child_id == libwebm::kMkvMasteringMetadata) {
-      if (!MasteringMetadata::Parse(reader, read_pos, child_size,
-                                    &colour_ptr->mastering_metadata))
-        return false;
-    } else {
-      return false;
-    }
-
-    read_pos += child_size;
-    if (read_pos > colour_end)
-      return false;
-  }
-  *colour = colour_ptr.release();
-  return true;
-}
-
 VideoTrack::VideoTrack(Segment* pSegment, long long element_start,
                        long long element_size)
-    : Track(pSegment, element_start, element_size), m_colour(NULL) {}
-
-VideoTrack::~VideoTrack() { delete m_colour; }
+    : Track(pSegment, element_start, element_size) {}
 
 long VideoTrack::Parse(Segment* pSegment, const Info& info,
                        long long element_start, long long element_size,
@@ -5223,8 +4973,6 @@ long VideoTrack::Parse(Segment* pSegment, const Info& info,
 
   const long long stop = pos + s.size;
 
-  Colour* colour = NULL;
-
   while (pos < stop) {
     long long id, size;
 
@@ -5233,46 +4981,43 @@ long VideoTrack::Parse(Segment* pSegment, const Info& info,
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvPixelWidth) {
+    if (id == 0x30) {  // pixel width
       width = UnserializeUInt(pReader, pos, size);
 
       if (width <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvPixelHeight) {
+    } else if (id == 0x3A) {  // pixel height
       height = UnserializeUInt(pReader, pos, size);
 
       if (height <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvDisplayWidth) {
+    } else if (id == 0x14B0) {  // display width
       display_width = UnserializeUInt(pReader, pos, size);
 
       if (display_width <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvDisplayHeight) {
+    } else if (id == 0x14BA) {  // display height
       display_height = UnserializeUInt(pReader, pos, size);
 
       if (display_height <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvDisplayUnit) {
+    } else if (id == 0x14B2) {  // display unit
       display_unit = UnserializeUInt(pReader, pos, size);
 
       if (display_unit < 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvStereoMode) {
+    } else if (id == 0x13B8) {  // stereo mode
       stereo_mode = UnserializeUInt(pReader, pos, size);
 
       if (stereo_mode < 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvFrameRate) {
+    } else if (id == 0x0383E3) {  // frame rate
       const long status = UnserializeFloat(pReader, pos, size, rate);
 
       if (status < 0)
         return status;
 
       if (rate <= 0)
-        return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvColour) {
-      if (!Colour::Parse(pReader, pos, size, &colour))
         return E_FILE_FORMAT_INVALID;
     }
 
@@ -5304,7 +5049,6 @@ long VideoTrack::Parse(Segment* pSegment, const Info& info,
   pTrack->m_display_unit = display_unit;
   pTrack->m_stereo_mode = stereo_mode;
   pTrack->m_rate = rate;
-  pTrack->m_colour = colour;
 
   pResult = pTrack;
   return 0;  // success
@@ -5403,8 +5147,6 @@ long VideoTrack::Seek(long long time_ns, const BlockEntry*& pResult) const {
   return 0;
 }
 
-Colour* VideoTrack::GetColour() const { return m_colour; }
-
 long long VideoTrack::GetWidth() const { return m_width; }
 
 long long VideoTrack::GetHeight() const { return m_height; }
@@ -5459,7 +5201,7 @@ long AudioTrack::Parse(Segment* pSegment, const Info& info,
     if (status < 0)  // error
       return status;
 
-    if (id == libwebm::kMkvSamplingFrequency) {
+    if (id == 0x35) {  // Sample Rate
       status = UnserializeFloat(pReader, pos, size, rate);
 
       if (status < 0)
@@ -5467,12 +5209,12 @@ long AudioTrack::Parse(Segment* pSegment, const Info& info,
 
       if (rate <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvChannels) {
+    } else if (id == 0x1F) {  // Channel Count
       channels = UnserializeUInt(pReader, pos, size);
 
       if (channels <= 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvBitDepth) {
+    } else if (id == 0x2264) {  // Bit Depth
       bit_depth = UnserializeUInt(pReader, pos, size);
 
       if (bit_depth <= 0)
@@ -5545,7 +5287,7 @@ long Tracks::Parse() {
     if (size == 0)  // weird
       continue;
 
-    if (id == libwebm::kMkvTrackEntry)
+    if (id == 0x2E)  // TrackEntry ID
       ++count;
 
     pos += size;  // consume payload
@@ -5587,12 +5329,13 @@ long Tracks::Parse() {
 
     const long long element_size = payload_stop - element_start;
 
-    if (id == libwebm::kMkvTrackEntry) {
+    if (id == 0x2E) {  // TrackEntry ID
       Track*& pTrack = *m_trackEntriesEnd;
       pTrack = NULL;
 
       const long status = ParseTrackEntry(pos, payload_size, element_start,
                                           element_size, pTrack);
+
       if (status)
         return status;
 
@@ -5663,16 +5406,16 @@ long Tracks::ParseTrackEntry(long long track_start, long long track_size,
 
     const long long start = pos;
 
-    if (id == libwebm::kMkvVideo) {
+    if (id == 0x60) {  // VideoSettings ID
       v.start = start;
       v.size = size;
-    } else if (id == libwebm::kMkvAudio) {
+    } else if (id == 0x61) {  // AudioSettings ID
       a.start = start;
       a.size = size;
-    } else if (id == libwebm::kMkvContentEncodings) {
+    } else if (id == 0x2D80) {  // ContentEncodings ID
       e.start = start;
       e.size = size;
-    } else if (id == libwebm::kMkvTrackUID) {
+    } else if (id == 0x33C5) {  // Track UID
       if (size > 8)
         return E_FILE_FORMAT_INVALID;
 
@@ -5694,49 +5437,49 @@ long Tracks::ParseTrackEntry(long long track_start, long long track_size,
 
         ++pos_;
       }
-    } else if (id == libwebm::kMkvTrackNumber) {
+    } else if (id == 0x57) {  // Track Number
       const long long num = UnserializeUInt(pReader, pos, size);
 
       if ((num <= 0) || (num > 127))
         return E_FILE_FORMAT_INVALID;
 
       info.number = static_cast<long>(num);
-    } else if (id == libwebm::kMkvTrackType) {
+    } else if (id == 0x03) {  // Track Type
       const long long type = UnserializeUInt(pReader, pos, size);
 
       if ((type <= 0) || (type > 254))
         return E_FILE_FORMAT_INVALID;
 
       info.type = static_cast<long>(type);
-    } else if (id == libwebm::kMkvName) {
+    } else if (id == 0x136E) {  // Track Name
       const long status =
           UnserializeString(pReader, pos, size, info.nameAsUTF8);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvLanguage) {
+    } else if (id == 0x02B59C) {  // Track Language
       const long status = UnserializeString(pReader, pos, size, info.language);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvDefaultDuration) {
+    } else if (id == 0x03E383) {  // Default Duration
       const long long duration = UnserializeUInt(pReader, pos, size);
 
       if (duration < 0)
         return E_FILE_FORMAT_INVALID;
 
       info.defaultDuration = static_cast<unsigned long long>(duration);
-    } else if (id == libwebm::kMkvCodecID) {
+    } else if (id == 0x06) {  // CodecID
       const long status = UnserializeString(pReader, pos, size, info.codecId);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvFlagLacing) {
+    } else if (id == 0x1C) {  // lacing
       lacing = UnserializeUInt(pReader, pos, size);
 
       if ((lacing < 0) || (lacing > 1))
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvCodecPrivate) {
+    } else if (id == 0x23A2) {  // Codec Private
       delete[] info.codecPrivate;
       info.codecPrivate = NULL;
       info.codecPrivateSize = 0;
@@ -5759,15 +5502,15 @@ long Tracks::ParseTrackEntry(long long track_start, long long track_size,
         info.codecPrivate = buf;
         info.codecPrivateSize = buflen;
       }
-    } else if (id == libwebm::kMkvCodecName) {
+    } else if (id == 0x058688) {  // Codec Name
       const long status =
           UnserializeString(pReader, pos, size, info.codecNameAsUTF8);
 
       if (status)
         return status;
-    } else if (id == libwebm::kMkvCodecDelay) {
+    } else if (id == 0x16AA) {  // Codec Delay
       info.codecDelay = UnserializeUInt(pReader, pos, size);
-    } else if (id == libwebm::kMkvSeekPreRoll) {
+    } else if (id == 0x16BB) {  // Seek Pre Roll
       info.seekPreRoll = UnserializeUInt(pReader, pos, size);
     }
 
@@ -5906,87 +5649,97 @@ const Track* Tracks::GetTrackByIndex(unsigned long idx) const {
 }
 
 long Cluster::Load(long long& pos, long& len) const {
-  if (m_pSegment == NULL)
-    return E_PARSE_FAILED;
+  assert(m_pSegment);
+  assert(m_pos >= m_element_start);
 
   if (m_timecode >= 0)  // at least partially loaded
     return 0;
 
-  if (m_pos != m_element_start || m_element_size >= 0)
-    return E_PARSE_FAILED;
+  assert(m_pos == m_element_start);
+  assert(m_element_size < 0);
 
   IMkvReader* const pReader = m_pSegment->m_pReader;
+
   long long total, avail;
+
   const int status = pReader->Length(&total, &avail);
 
   if (status < 0)  // error
     return status;
 
-  if (total >= 0 && (avail > total || m_pos > total))
-    return E_FILE_FORMAT_INVALID;
+  assert((total < 0) || (avail <= total));
+  assert((total < 0) || (m_pos <= total));  // TODO: verify this
 
   pos = m_pos;
 
   long long cluster_size = -1;
 
-  if ((pos + 1) > avail) {
-    len = 1;
-    return E_BUFFER_NOT_FULL;
+  {
+    if ((pos + 1) > avail) {
+      len = 1;
+      return E_BUFFER_NOT_FULL;
+    }
+
+    long long result = GetUIntLength(pReader, pos, len);
+
+    if (result < 0)  // error or underflow
+      return static_cast<long>(result);
+
+    if (result > 0)  // underflow (weird)
+      return E_BUFFER_NOT_FULL;
+
+    // if ((pos + len) > segment_stop)
+    //    return E_FILE_FORMAT_INVALID;
+
+    if ((pos + len) > avail)
+      return E_BUFFER_NOT_FULL;
+
+    const long long id_ = ReadUInt(pReader, pos, len);
+
+    if (id_ < 0)  // error
+      return static_cast<long>(id_);
+
+    if (id_ != 0x0F43B675)  // Cluster ID
+      return E_FILE_FORMAT_INVALID;
+
+    pos += len;  // consume id
+
+    // read cluster size
+
+    if ((pos + 1) > avail) {
+      len = 1;
+      return E_BUFFER_NOT_FULL;
+    }
+
+    result = GetUIntLength(pReader, pos, len);
+
+    if (result < 0)  // error
+      return static_cast<long>(result);
+
+    if (result > 0)  // weird
+      return E_BUFFER_NOT_FULL;
+
+    // if ((pos + len) > segment_stop)
+    //    return E_FILE_FORMAT_INVALID;
+
+    if ((pos + len) > avail)
+      return E_BUFFER_NOT_FULL;
+
+    const long long size = ReadUInt(pReader, pos, len);
+
+    if (size < 0)  // error
+      return static_cast<long>(cluster_size);
+
+    if (size == 0)
+      return E_FILE_FORMAT_INVALID;  // TODO: verify this
+
+    pos += len;  // consume length of size of element
+
+    const long long unknown_size = (1LL << (7 * len)) - 1;
+
+    if (size != unknown_size)
+      cluster_size = size;
   }
-
-  long long result = GetUIntLength(pReader, pos, len);
-
-  if (result < 0)  // error or underflow
-    return static_cast<long>(result);
-
-  if (result > 0)
-    return E_BUFFER_NOT_FULL;
-
-  if ((pos + len) > avail)
-    return E_BUFFER_NOT_FULL;
-
-  const long long id_ = ReadID(pReader, pos, len);
-
-  if (id_ < 0)  // error
-    return static_cast<long>(id_);
-
-  if (id_ != libwebm::kMkvCluster)
-    return E_FILE_FORMAT_INVALID;
-
-  pos += len;  // consume id
-
-  // read cluster size
-
-  if ((pos + 1) > avail) {
-    len = 1;
-    return E_BUFFER_NOT_FULL;
-  }
-
-  result = GetUIntLength(pReader, pos, len);
-
-  if (result < 0)  // error
-    return static_cast<long>(result);
-
-  if (result > 0)
-    return E_BUFFER_NOT_FULL;
-
-  if ((pos + len) > avail)
-    return E_BUFFER_NOT_FULL;
-
-  const long long size = ReadUInt(pReader, pos, len);
-
-  if (size < 0)  // error
-    return static_cast<long>(cluster_size);
-
-  if (size == 0)
-    return E_FILE_FORMAT_INVALID;
-
-  pos += len;  // consume length of size of element
-
-  const long long unknown_size = (1LL << (7 * len)) - 1;
-
-  if (size != unknown_size)
-    cluster_size = size;
 
   // pos points to start of payload
   long long timecode = -1;
@@ -6011,7 +5764,7 @@ long Cluster::Load(long long& pos, long& len) const {
     if (result < 0)  // error
       return static_cast<long>(result);
 
-    if (result > 0)
+    if (result > 0)  // weird
       return E_BUFFER_NOT_FULL;
 
     if ((cluster_stop >= 0) && ((pos + len) > cluster_stop))
@@ -6020,7 +5773,7 @@ long Cluster::Load(long long& pos, long& len) const {
     if ((pos + len) > avail)
       return E_BUFFER_NOT_FULL;
 
-    const long long id = ReadID(pReader, pos, len);
+    const long long id = ReadUInt(pReader, pos, len);
 
     if (id < 0)  // error
       return static_cast<long>(id);
@@ -6032,10 +5785,10 @@ long Cluster::Load(long long& pos, long& len) const {
     // that we have exhausted the sub-element's inside the cluster
     // whose ID we parsed earlier.
 
-    if (id == libwebm::kMkvCluster)
+    if (id == 0x0F43B675)  // Cluster ID
       break;
 
-    if (id == libwebm::kMkvCues)
+    if (id == 0x0C53BB6B)  // Cues ID
       break;
 
     pos += len;  // consume ID field
@@ -6052,7 +5805,7 @@ long Cluster::Load(long long& pos, long& len) const {
     if (result < 0)  // error
       return static_cast<long>(result);
 
-    if (result > 0)
+    if (result > 0)  // weird
       return E_BUFFER_NOT_FULL;
 
     if ((cluster_stop >= 0) && ((pos + len) > cluster_stop))
@@ -6078,13 +5831,13 @@ long Cluster::Load(long long& pos, long& len) const {
 
     // pos now points to start of payload
 
-    if (size == 0)
+    if (size == 0)  // weird
       continue;
 
     if ((cluster_stop >= 0) && ((pos + size) > cluster_stop))
       return E_FILE_FORMAT_INVALID;
 
-    if (id == libwebm::kMkvTimecode) {
+    if (id == 0x67) {  // TimeCode ID
       len = static_cast<long>(size);
 
       if ((pos + size) > avail)
@@ -6099,10 +5852,10 @@ long Cluster::Load(long long& pos, long& len) const {
 
       if (bBlock)
         break;
-    } else if (id == libwebm::kMkvBlockGroup) {
+    } else if (id == 0x20) {  // BlockGroup ID
       bBlock = true;
       break;
-    } else if (id == libwebm::kMkvSimpleBlock) {
+    } else if (id == 0x23) {  // SimpleBlock ID
       bBlock = true;
       break;
     }
@@ -6136,8 +5889,10 @@ long Cluster::Parse(long long& pos, long& len) const {
   if (status < 0)
     return status;
 
-  if (m_pos < m_element_start || m_timecode < 0)
-    return E_PARSE_FAILED;
+  assert(m_pos >= m_element_start);
+  assert(m_timecode >= 0);
+  // assert(m_size > 0);
+  // assert(m_element_size > m_size);
 
   const long long cluster_stop =
       (m_element_size < 0) ? -1 : m_element_start + m_element_size;
@@ -6154,8 +5909,7 @@ long Cluster::Parse(long long& pos, long& len) const {
   if (status < 0)  // error
     return status;
 
-  if (total >= 0 && avail > total)
-    return E_FILE_FORMAT_INVALID;
+  assert((total < 0) || (avail <= total));
 
   pos = m_pos;
 
@@ -6182,7 +5936,7 @@ long Cluster::Parse(long long& pos, long& len) const {
     if (result < 0)  // error
       return static_cast<long>(result);
 
-    if (result > 0)
+    if (result > 0)  // weird
       return E_BUFFER_NOT_FULL;
 
     if ((cluster_stop >= 0) && ((pos + len) > cluster_stop))
@@ -6191,16 +5945,19 @@ long Cluster::Parse(long long& pos, long& len) const {
     if ((pos + len) > avail)
       return E_BUFFER_NOT_FULL;
 
-    const long long id = ReadID(pReader, pos, len);
+    const long long id = ReadUInt(pReader, pos, len);
 
-    if (id < 0)
+    if (id < 0)  // error
+      return static_cast<long>(id);
+
+    if (id == 0)  // weird
       return E_FILE_FORMAT_INVALID;
 
     // This is the distinguished set of ID's we use to determine
     // that we have exhausted the sub-element's inside the cluster
     // whose ID we parsed earlier.
 
-    if ((id == libwebm::kMkvCluster) || (id == libwebm::kMkvCues)) {
+    if ((id == 0x0F43B675) || (id == 0x0C53BB6B)) {  // Cluster or Cues ID
       if (m_element_size < 0)
         m_element_size = pos - m_element_start;
 
@@ -6221,7 +5978,7 @@ long Cluster::Parse(long long& pos, long& len) const {
     if (result < 0)  // error
       return static_cast<long>(result);
 
-    if (result > 0)
+    if (result > 0)  // weird
       return E_BUFFER_NOT_FULL;
 
     if ((cluster_stop >= 0) && ((pos + len) > cluster_stop))
@@ -6247,7 +6004,7 @@ long Cluster::Parse(long long& pos, long& len) const {
 
     // pos now points to start of payload
 
-    if (size == 0)
+    if (size == 0)  // weird
       continue;
 
     // const long long block_start = pos;
@@ -6255,9 +6012,8 @@ long Cluster::Parse(long long& pos, long& len) const {
 
     if (cluster_stop >= 0) {
       if (block_stop > cluster_stop) {
-        if (id == libwebm::kMkvBlockGroup || id == libwebm::kMkvSimpleBlock) {
+        if ((id == 0x20) || (id == 0x23))
           return E_FILE_FORMAT_INVALID;
-        }
 
         pos = cluster_stop;
         break;
@@ -6273,10 +6029,10 @@ long Cluster::Parse(long long& pos, long& len) const {
 
     Cluster* const this_ = const_cast<Cluster*>(this);
 
-    if (id == libwebm::kMkvBlockGroup)
+    if (id == 0x20)  // BlockGroup
       return this_->ParseBlockGroup(size, pos, len);
 
-    if (id == libwebm::kMkvSimpleBlock)
+    if (id == 0x23)  // SimpleBlock
       return this_->ParseSimpleBlock(size, pos, len);
 
     pos += size;  // consume payload
@@ -6284,8 +6040,7 @@ long Cluster::Parse(long long& pos, long& len) const {
       return E_FILE_FORMAT_INVALID;
   }
 
-  if (m_element_size < 1)
-    return E_FILE_FORMAT_INVALID;
+  assert(m_element_size > 0);
 
   m_pos = pos;
   if (cluster_stop >= 0 && m_pos > cluster_stop)
@@ -6295,26 +6050,23 @@ long Cluster::Parse(long long& pos, long& len) const {
     const long idx = m_entries_count - 1;
 
     const BlockEntry* const pLast = m_entries[idx];
-    if (pLast == NULL)
-      return E_PARSE_FAILED;
+    assert(pLast);
 
     const Block* const pBlock = pLast->GetBlock();
-    if (pBlock == NULL)
-      return E_PARSE_FAILED;
+    assert(pBlock);
 
     const long long start = pBlock->m_start;
 
     if ((total >= 0) && (start > total))
-      return E_PARSE_FAILED;  // defend against trucated stream
+      return -1;  // defend against trucated stream
 
     const long long size = pBlock->m_size;
 
     const long long stop = start + size;
-    if (cluster_stop >= 0 && stop > cluster_stop)
-      return E_FILE_FORMAT_INVALID;
+    assert((cluster_stop < 0) || (stop <= cluster_stop));
 
     if ((total >= 0) && (stop > total))
-      return E_PARSE_FAILED;  // defend against trucated stream
+      return -1;  // defend against trucated stream
   }
 
   return 1;  // no more entries
@@ -6407,7 +6159,8 @@ long Cluster::ParseSimpleBlock(long long block_size, long long& pos,
     return E_BUFFER_NOT_FULL;
   }
 
-  status = CreateBlock(libwebm::kMkvSimpleBlock, block_start, block_size,
+  status = CreateBlock(0x23,  // simple block id
+                       block_start, block_size,
                        0);  // DiscardPadding
 
   if (status != 0)
@@ -6466,12 +6219,12 @@ long Cluster::ParseBlockGroup(long long payload_size, long long& pos,
     if ((pos + len) > avail)
       return E_BUFFER_NOT_FULL;
 
-    const long long id = ReadID(pReader, pos, len);
+    const long long id = ReadUInt(pReader, pos, len);
 
     if (id < 0)  // error
       return static_cast<long>(id);
 
-    if (id == 0)  // not a valid ID
+    if (id == 0)  // not a value ID
       return E_FILE_FORMAT_INVALID;
 
     pos += len;  // consume ID field
@@ -6517,14 +6270,14 @@ long Cluster::ParseBlockGroup(long long payload_size, long long& pos,
     if (size == unknown_size)
       return E_FILE_FORMAT_INVALID;
 
-    if (id == libwebm::kMkvDiscardPadding) {
+    if (id == 0x35A2) {  // DiscardPadding
       status = UnserializeInt(pReader, pos, size, discard_padding);
 
       if (status < 0)  // error
         return status;
     }
 
-    if (id != libwebm::kMkvBlock) {
+    if (id != 0x21) {  // sub-part of BlockGroup is not a Block
       pos += size;  // consume sub-part of block group
 
       if (pos > payload_stop)
@@ -6617,8 +6370,8 @@ long Cluster::ParseBlockGroup(long long payload_size, long long& pos,
   if (pos != payload_stop)
     return E_FILE_FORMAT_INVALID;
 
-  status = CreateBlock(libwebm::kMkvBlockGroup, payload_start, payload_size,
-                       discard_padding);
+  status = CreateBlock(0x20,  // BlockGroup ID
+                       payload_start, payload_size, discard_padding);
   if (status != 0)
     return status;
 
@@ -6778,13 +6531,13 @@ long Cluster::HasBlockEntries(
     if ((pos + len) > avail)
       return E_BUFFER_NOT_FULL;
 
-    const long long id = ReadID(pReader, pos, len);
+    const long long id = ReadUInt(pReader, pos, len);
 
     if (id < 0)  // error
       return static_cast<long>(id);
 
-    if (id != libwebm::kMkvCluster)
-      return E_PARSE_FAILED;
+    if (id != 0x0F43B675)  // weird: not cluster ID
+      return -1;  // generic error
 
     pos += len;  // consume Cluster ID field
 
@@ -6862,7 +6615,7 @@ long Cluster::HasBlockEntries(
     if ((pos + len) > avail)
       return E_BUFFER_NOT_FULL;
 
-    const long long id = ReadID(pReader, pos, len);
+    const long long id = ReadUInt(pReader, pos, len);
 
     if (id < 0)  // error
       return static_cast<long>(id);
@@ -6871,10 +6624,10 @@ long Cluster::HasBlockEntries(
     // that we have exhausted the sub-element's inside the cluster
     // whose ID we parsed earlier.
 
-    if (id == libwebm::kMkvCluster)
+    if (id == 0x0F43B675)  // Cluster ID
       return 0;  // no entries found
 
-    if (id == libwebm::kMkvCues)
+    if (id == 0x0C53BB6B)  // Cues ID
       return 0;  // no entries found
 
     pos += len;  // consume id field
@@ -6926,10 +6679,10 @@ long Cluster::HasBlockEntries(
     if ((cluster_stop >= 0) && ((pos + size) > cluster_stop))
       return E_FILE_FORMAT_INVALID;
 
-    if (id == libwebm::kMkvBlockGroup)
+    if (id == 0x20)  // BlockGroup ID
       return 1;  // have at least one entry
 
-    if (id == libwebm::kMkvSimpleBlock)
+    if (id == 0x23)  // SimpleBlock ID
       return 1;  // have at least one entry
 
     pos += size;  // consume payload
@@ -7004,8 +6757,7 @@ long long Cluster::GetLastTime() const {
 long Cluster::CreateBlock(long long id,
                           long long pos,  // absolute pos of payload
                           long long size, long long discard_padding) {
-  if (id != libwebm::kMkvBlockGroup && id != libwebm::kMkvSimpleBlock)
-    return E_PARSE_FAILED;
+  assert((id == 0x20) || (id == 0x23));  // BlockGroup or SimpleBlock
 
   if (m_entries_count < 0) {  // haven't parsed anything yet
     assert(m_entries == NULL);
@@ -7044,9 +6796,9 @@ long Cluster::CreateBlock(long long id,
     }
   }
 
-  if (id == libwebm::kMkvBlockGroup)
+  if (id == 0x20)  // BlockGroup ID
     return CreateBlockGroup(pos, size, discard_padding);
-  else
+  else  // SimpleBlock ID
     return CreateSimpleBlock(pos, size);
 }
 
@@ -7089,12 +6841,12 @@ long Cluster::CreateBlockGroup(long long start_offset, long long size,
 
     pos += len;  // consume size
 
-    if (id == libwebm::kMkvBlock) {
+    if (id == 0x21) {  // Block ID
       if (bpos < 0) {  // Block ID
         bpos = pos;
         bsize = size;
       }
-    } else if (id == libwebm::kMkvBlockDuration) {
+    } else if (id == 0x1B) {  // Duration ID
       if (size > 8)
         return E_FILE_FORMAT_INVALID;
 
@@ -7102,7 +6854,7 @@ long Cluster::CreateBlockGroup(long long start_offset, long long size,
 
       if (duration < 0)
         return E_FILE_FORMAT_INVALID;
-    } else if (id == libwebm::kMkvReferenceBlock) {
+    } else if (id == 0x7B) {  // ReferenceBlock
       if (size > 8 || size <= 0)
         return E_FILE_FORMAT_INVALID;
       const long size_ = static_cast<long>(size);
@@ -7116,7 +6868,7 @@ long Cluster::CreateBlockGroup(long long start_offset, long long size,
 
       if (time <= 0)  // see note above
         prev = time;
-      else
+      else  // weird
         next = time;
     }
 
@@ -7449,6 +7201,7 @@ const BlockEntry* Cluster::GetEntry(const CuePoint& cp,
 
 BlockEntry::BlockEntry(Cluster* p, long idx) : m_pCluster(p), m_index(idx) {}
 BlockEntry::~BlockEntry() {}
+bool BlockEntry::EOS() const { return (GetKind() == kBlockEOS); }
 const Cluster* BlockEntry::GetCluster() const { return m_pCluster; }
 long BlockEntry::GetIndex() const { return m_index; }
 
@@ -7772,6 +7525,7 @@ long Block::Parse(const Cluster* pCluster) {
       if (pf >= pf_end)
         return E_FILE_FORMAT_INVALID;
 
+
       const Frame& prev = *pf++;
       assert(prev.len == frame_size);
       if (prev.len != frame_size)
@@ -7937,4 +7691,4 @@ long Block::Frame::Read(IMkvReader* pReader, unsigned char* buf) const {
 
 long long Block::GetDiscardPadding() const { return m_discard_padding; }
 
-}  // namespace mkvparser
+}  // end namespace mkvparser
